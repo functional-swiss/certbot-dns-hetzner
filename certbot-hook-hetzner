@@ -1,79 +1,223 @@
 #!/bin/bash
 set -eu
 
-# PREPARATION
+# certbot-hook-hetzner v2 — Hetzner Cloud API (api.hetzner.cloud/v1)
+#
+# DNS-01 challenge hook for certbot using the Hetzner Cloud DNS API.
+# Supports CNAME delegation: if _acme-challenge.DOMAIN has a CNAME,
+# the challenge record is created in the target zone instead.
+#
+# Usage:
+#   certbot ... --manual-auth-hook './certbot-hook-hetzner auth' \
+#               --manual-cleanup-hook './certbot-hook-hetzner cleanup'
+#
+# Config:
+#   /etc/hetzner-dns-token — Hetzner Cloud API token (from console.hetzner.com)
 
-# env vars from certbot:
-# the hostname that is is validated
-challenge_domain="$CERTBOT_DOMAIN"
-# the content of the validation challenge
+# --- Configuration ---
+
+api_base_url="https://api.hetzner.cloud/v1"
+api_auth_token=$(cat "${HETZNER_DNS_TOKEN_FILE:-/etc/hetzner-dns-token}")
+dns_wait_max=300  # max seconds to wait for DNS propagation (5 minutes)
+http_code=""      # set by api()
+api_response=""   # set by api()
+
+# env vars from certbot
 challenge_string="$CERTBOT_VALIDATION"
+# The TXT record must be at _acme-challenge.DOMAIN
+challenge_domain="_acme-challenge.${CERTBOT_DOMAIN}"
 
-# our config, the API token for the Hetzner DNS API
-api_auth_token=$(cat /etc/hetzner-dns-token)
-external_dns_server=8.8.8.8 # google
+# --- API Helper ---
 
-# check if validation for this hostname was delegated (with a CNAME record)
-echo "Validating domain '${challenge_domain}'"
-challenge_cname="$(dig +noall +short "_acme-challenge.${CERTBOT_DOMAIN}" | sed 's/\.$//')"
-if test -n "$challenge_cname"; then challenge_domain="$challenge_cname"; fi
+# Makes an authenticated API call.
+# Sets global $api_response (body) and $http_code (status).
+# Usage: api METHOD path [json_body]
+api() {
+  local method="$1" path="$2" body="${3:-}"
+  local raw_response
+
+  local curl_args=(
+    --silent
+    -X "$method"
+    -H "Authorization: Bearer ${api_auth_token}"
+    -H "Content-Type: application/json"
+    -H "Accept: application/json"
+    -w "\n%{http_code}"
+  )
+  if [ -n "$body" ]; then
+    curl_args+=(-d "$body")
+  fi
+
+  raw_response=$(curl "${curl_args[@]}" "${api_base_url}${path}")
+  http_code=$(echo "$raw_response" | tail -1)
+  api_response=$(echo "$raw_response" | sed '$d')
+}
+
+# Check HTTP response and exit with error if not in expected range
+# Usage: check_http context_message expected_code [expected_code2...]
+check_http() {
+  local context="$1"; shift
+  for code in "$@"; do
+    if [ "$http_code" = "$code" ]; then return 0; fi
+  done
+  echo "ERROR: ${context} — HTTP ${http_code}" >&2
+  if [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
+    echo "  Authentication failed. Make sure /etc/hetzner-dns-token contains" >&2
+    echo "  a Hetzner Cloud API token from console.hetzner.com > Security > API Tokens" >&2
+    echo "  (NOT the old DNS Console token from dns.hetzner.com)" >&2
+  fi
+  exit 1
+}
+
+# Poll an async action until it completes.
+# Usage: handle_action action_id context_message
+handle_action() {
+  local action_id="$1" context="$2"
+  local attempt=0 max_attempts=60 status
+
+  while [ $attempt -lt $max_attempts ]; do
+    api GET "/actions/${action_id}"
+    status=$(echo "$api_response" | jq -r '.action.status // .actions[0].status // "unknown"')
+    case "$status" in
+      success) return 0 ;;
+      error)
+        local msg
+        msg=$(echo "$api_response" | jq -r '.action.error.message // .actions[0].error.message // "unknown error"')
+        echo "ERROR: ${context} action failed: ${msg}" >&2
+        exit 1
+        ;;
+    esac
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  echo "ERROR: ${context} action timed out after ${max_attempts}s" >&2
+  exit 1
+}
+
+# Process actions from the last api() call if present.
+# Usage: handle_actions "context message"
+handle_actions() {
+  local context="$1" action_ids
+
+  # API returns either { "action": {...} } or { "actions": [...] }
+  action_ids=$(echo "$api_response" | jq -r '(.action.id // empty), (.actions[]?.id // empty)' 2>/dev/null)
+
+  for action_id in $action_ids; do
+    echo "  waiting for action ${action_id}..."
+    handle_action "$action_id" "$context"
+  done
+}
+
+# --- CNAME resolution ---
+# If _acme-challenge.DOMAIN has a CNAME, follow it (delegation to another zone).
+
+echo "Validating domain '${CERTBOT_DOMAIN}'"
+challenge_cname="$(dig +noall +short -t CNAME "${challenge_domain}" | sed 's/\.$//')"
+if [ -n "$challenge_cname" ]; then
+  echo "  CNAME delegation: ${challenge_domain} -> ${challenge_cname}"
+  challenge_domain="$challenge_cname"
+fi
 echo "Using challenge domain '${challenge_domain}'"
 
-# find the id of the "zone" in the DNS console which we need to modify
+# --- Zone discovery ---
+# Walk up subdomains to find which zone contains our challenge domain.
+
 zone_domain="$challenge_domain"
-while test -z "${zone_id:-}" ; do
-  zone_id=$(curl --silent -H "Auth-API-Token: ${api_auth_token}" \
-    "https://dns.hetzner.com/api/v1/zones?search_name=${zone_domain}" | \
-    jq ".\"zones\"[] | select(.name == \"${zone_domain}\") | .id" 2>/dev/null | tr -d '"')
-  if ! test -z "$zone_id"; then
-    echo "Using DNS zone '${zone_domain}' with id '${zone_id}"
+zone_id=""
+
+while [ -z "$zone_id" ]; do
+  api GET "/zones?name=${zone_domain}"
+  zone_id=$(echo "$api_response" | jq -r '.zones[]? | select(.name == "'"${zone_domain}"'") | .id // empty' 2>/dev/null)
+
+  if [ -n "$zone_id" ]; then
+    echo "Using DNS zone '${zone_domain}' with id '${zone_id}'"
     break
-  else
-    # if not found yet, continue looking with 1 less sudomain
-    zone_domain="$(echo "$zone_domain" | cut -s -d'.' -f 2-)"
   fi
-  # fail when search is exhausted (no more subdomains to remove)
-  if test -z "$zone_domain"; then
-    echo "ERROR: could not find DNS zone!" >&2
+
+  # strip one subdomain level and try again
+  zone_domain="$(echo "$zone_domain" | cut -s -d'.' -f 2-)"
+
+  if [ -z "$zone_domain" ]; then
+    echo "ERROR: could not find DNS zone for '${challenge_domain}'!" >&2
+    echo "  Make sure the zone exists in your Hetzner Cloud project and the API token has access." >&2
     exit 1
   fi
 done
 
-# COMMANDS
+# Compute record name relative to the zone (used in API URL path)
+if [ "$challenge_domain" = "$zone_domain" ]; then
+  record_name="@"
+else
+  record_name="${challenge_domain%."${zone_domain}"}"
+fi
 
-auth(){
-  # clenaup any old records
-  cleanup
+# URL-encode the record name (handles underscores, dots in subdomain names)
+url_encoded_name=$(printf '%s' "$record_name" | jq -sRr @uri)
 
-  # create the challenge DNS record
-  curl --silent -X "POST" "https://dns.hetzner.com/api/v1/records" \
-    -H 'Content-Type: application/json' \
-    -H "Auth-API-Token: ${api_auth_token}" \
-    -d "{ \"value\": \"${challenge_string}\", \"ttl\": 30, \"type\": \"TXT\", \"name\": \"${challenge_domain}.\", \"zone_id\": \"${zone_id}\" }"
+# --- Commands ---
 
-  # wait until we can observe the correct value in the DNS record
-  printf "waiting for DNS record to be visible on external DNS ($external_dns_server)..." && \
-  while ! test "\"${challenge_string}\"" = "$(dig @"$external_dns_server" -t txt +short "${challenge_domain}")"; do printf '.'; sleep 5; done
-  echo " OK!"
+auth() {
+  echo "Creating TXT record '${record_name}' in zone '${zone_domain}'..."
+
+  # The Cloud API value must be double-quoted inside the JSON string
+  local body
+  body=$(jq -n --arg val "$challenge_string" '{ttl: 60, records: [{value: ("\"\($val)\"") }]}')
+
+  api POST "/zones/${zone_id}/rrsets/${url_encoded_name}/TXT/actions/add_records" "$body"
+  check_http "creating TXT record" 200 201
+
+  handle_actions "add TXT record"
+  echo "  TXT record created."
+
+  # Wait for DNS propagation on multiple resolvers
+  local waited=0 dns_ok=0
+  local dns_servers="8.8.8.8 1.1.1.1"
+  printf "  waiting for DNS propagation..."
+  while [ $waited -lt $dns_wait_max ]; do
+    dns_ok=0
+    for dns in $dns_servers; do
+      observed=$(dig @"$dns" -t txt +short "${challenge_domain}" 2>/dev/null || true)
+      if echo "$observed" | grep -qF "$challenge_string"; then
+        dns_ok=$((dns_ok + 1))
+      fi
+    done
+    if [ $dns_ok -ge 2 ]; then
+      echo " OK! (${waited}s, verified on ${dns_ok} resolvers)"
+      return 0
+    fi
+    printf '.'
+    sleep 5
+    waited=$((waited + 5))
+  done
+  echo " TIMEOUT after ${dns_wait_max}s" >&2
+  echo "  WARNING: DNS record may not have propagated. Certbot validation might fail." >&2
 }
 
 cleanup() {
-  # find and delete the validation record (possibly several)
-  record_ids=$(curl --silent -H "Auth-API-Token: ${api_auth_token}" \
-          "https://dns.hetzner.com/api/v1/records?zone_id=$zone_id" | \
-        jq ".\"records\"[] | select(.name == \"${challenge_domain}.\") | .id" 2>/dev/null | tr -d '"')
+  echo "Removing TXT record '${record_name}' from zone '${zone_domain}'..."
 
-  for record_id in $record_ids; do
-    curl --silent -H "Auth-API-Token: ${api_auth_token}" \
-      -X "DELETE" "https://dns.hetzner.com/api/v1/records/${record_id}"
-  done
+  local body
+  body=$(jq -n --arg val "$challenge_string" '{records: [{value: ("\"\($val)\"") }]}')
+
+  api POST "/zones/${zone_id}/rrsets/${url_encoded_name}/TXT/actions/remove_records" "$body"
+
+  # 200=removed, 404=already gone (both are fine for cleanup)
+  if [ "$http_code" = "404" ]; then
+    echo "  TXT record already gone."
+    return 0
+  fi
+  check_http "removing TXT record" 200 201
+
+  handle_actions "remove TXT record"
+  echo "  TXT record removed."
 }
 
-# RUN COMMAND
+# --- Run command ---
 
-if [[ $1 =~ ^(auth|cleanup)$ ]]; then
+if [[ ${1:-} =~ ^(auth|cleanup)$ ]]; then
   "$1"
 else
-  echo "Invalid command `$1`, valid commands are `auth` and `cleanup`" >&2
+  echo "Usage: certbot-hook-hetzner <auth|cleanup>" >&2
+  echo "  Invalid command '${1:-}'" >&2
   exit 1
 fi

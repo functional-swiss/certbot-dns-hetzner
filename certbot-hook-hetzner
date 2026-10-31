@@ -19,6 +19,7 @@ set -eu
 api_base_url="https://api.hetzner.cloud/v1"
 api_auth_token=$(cat "${HETZNER_DNS_TOKEN_FILE:-/etc/hetzner-dns-token}")
 dns_wait_max=300  # max seconds to wait for DNS propagation (5 minutes)
+dns_grace=30      # extra seconds to wait once every server shows the record
 http_code=""      # set by api()
 api_response=""   # set by api()
 
@@ -169,9 +170,13 @@ auth() {
   handle_actions "add TXT record"
   echo "  TXT record created."
 
-  # Wait for DNS propagation on multiple resolvers
-  local waited=0 dns_ok=0
-  local dns_servers="8.8.8.8 1.1.1.1"
+  # Wait until the zone's authoritative servers and two public resolvers all
+  # serve the record; the CA queries the authoritative servers directly.
+  local waited=0 dns_ok=0 dns_total
+  local auth_ns dns_servers
+  auth_ns=$(dig +short -t NS "${zone_domain}" 2>/dev/null | sed 's/\.$//' | tr '\n' ' ' || true)
+  dns_servers="${auth_ns}8.8.8.8 1.1.1.1"
+  dns_total=$(echo $dns_servers | wc -w)
   printf "  waiting for DNS propagation..."
   while [ $waited -lt $dns_wait_max ]; do
     dns_ok=0
@@ -181,8 +186,9 @@ auth() {
         dns_ok=$((dns_ok + 1))
       fi
     done
-    if [ $dns_ok -ge 2 ]; then
-      echo " OK! (${waited}s, verified on ${dns_ok} resolvers)"
+    if [ $dns_ok -ge "$dns_total" ]; then
+      echo " OK! (${waited}s, verified on ${dns_ok} servers)"
+      sleep "$dns_grace"
       return 0
     fi
     printf '.'
